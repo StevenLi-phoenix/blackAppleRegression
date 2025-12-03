@@ -20,7 +20,14 @@ MINIMAL_PATTERN_SIZE = MIMIMAL_PATTERN_SIZE  # Align naming with description
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-logger.addHandler(logging.StreamHandler())
+class TqdmLoggingHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.tqdm.write(msg)
+        except Exception:
+            self.handleError(record)
+logger.addHandler(TqdmLoggingHandler())
 
 def _md5_video_path(path: Path) -> str:
     return hashlib.md5(str(Path(path).resolve()).encode("utf-8")).hexdigest()
@@ -76,8 +83,6 @@ def process_frame_with_cache(frame: np.ndarray, video_hash: str, cache_root: Pat
             logger.info(f"Cache hit: {cache_file}")
             return cached
         logger.info(f"Cache miss (corrupted cache): {cache_file}")
-    else:
-        logger.info(f"Cache miss: {cache_file}")
 
     processed = process_frame(frame)
     cv2.imwrite(str(cache_file), processed)
@@ -156,8 +161,6 @@ class recursive_video_processor:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = None
         frame_count = 0
-        # temporary output directory
-        os.makedirs("output", exist_ok=True)
         
         for frame in stream:
             if frame is None or frame.size == 0:
@@ -179,8 +182,6 @@ class recursive_video_processor:
                     return
             
             out.write(frame)
-            # temporary output frame
-            cv2.imwrite(f"output/out_{frame_count}.png", frame)
             frame_count += 1
         
         if out is not None:
