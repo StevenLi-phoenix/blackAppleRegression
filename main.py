@@ -2,22 +2,56 @@ import cv2
 import numpy as np
 import os
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Optional
 import tqdm
 import time
 import logging
-import numba
 from multiprocessing import Pool
+import numba
 
 video_path = Path("BadApple.mp4")
 
 FAST_TEST = 100
 MIMIMAL_PATTERN_SIZE = 10  # 最小方块尺寸
+MINIMAL_PATTERN_SIZE = MIMIMAL_PATTERN_SIZE  # Align naming with description
 
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler())
+
+@numba.njit(cache=True)
+def find_first_fit(background_mask: np.ndarray, patch_h: int, patch_w: int):
+    """
+    在 background_mask 中找到首个全 True 的 patch_h x patch_w 区域。
+    返回 (found, top, left)。
+    """
+    h, w = background_mask.shape
+    if patch_h > h or patch_w > w:
+        return False, -1, -1
+
+    # 积分图加速区域求和，True 记作 1
+    integral = np.zeros((h + 1, w + 1), dtype=np.int32)
+    for i in range(h):
+        row_sum = 0
+        for j in range(w):
+            if background_mask[i, j]:
+                row_sum += 1
+            integral[i + 1, j + 1] = integral[i, j + 1] + row_sum
+
+    area = patch_h * patch_w
+    limit_h = h - patch_h + 1
+    limit_w = w - patch_w + 1
+    for top in range(limit_h):
+        y1 = top
+        y2 = top + patch_h
+        for left in range(limit_w):
+            x1 = left
+            x2 = left + patch_w
+            total = integral[y2, x2] - integral[y1, x2] - integral[y2, x1] + integral[y1, x1]
+            if total == area:
+                return True, top, left
+    return False, -1, -1
 
 class recursive_video_processor:
     video_informations = {
@@ -66,7 +100,19 @@ class recursive_video_processor:
         if show:
             cv2.destroyAllWindows()
 
-    def process_frame_stream(self, stream:Generator[np.ndarray, None, None]) -> Generator[np.ndarray, None, None]:
+    def process_frame_stream(
+        self,
+        stream:Generator[np.ndarray, None, None],
+        use_multiprocessing: bool = False,
+        workers: Optional[int] = None,
+    ) -> Generator[np.ndarray, None, None]:
+        if use_multiprocessing:
+            worker_count = workers or os.cpu_count() or 1
+            with Pool(processes=worker_count) as pool:
+                for processed in pool.imap(process_frame, stream, chunksize=1):
+                    yield processed
+            return
+
         for frame in stream:
             assert frame is not None, "Frame is None"
             assert frame.size > 0, "Frame is empty"
@@ -76,6 +122,8 @@ class recursive_video_processor:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = None
         frame_count = 0
+        # temporary output directory
+        os.makedirs("output", exist_ok=True)
         
         for frame in stream:
             if frame is None or frame.size == 0:
@@ -97,6 +145,8 @@ class recursive_video_processor:
                     return
             
             out.write(frame)
+            # temporary output frame
+            cv2.imwrite(f"output/out_{frame_count}.png", frame)
             frame_count += 1
         
         if out is not None:
@@ -111,9 +161,13 @@ class recursive_video_processor:
                 out.release()
                 logger.info(f"Video saved to {output_path}, frames written: {frame_count}")
 
-    def run(self):
+    def run(self, use_multiprocessing: bool = False, workers: Optional[int] = None):
         stream = self.play_video(video_path=video_path)
-        processed_stream = self.process_frame_stream(stream)
+        processed_stream = self.process_frame_stream(
+            stream,
+            use_multiprocessing=use_multiprocessing,
+            workers=workers,
+        )
         self.save_stream(processed_stream, output_path="out.mp4")
 
     @staticmethod
@@ -128,85 +182,92 @@ class recursive_video_processor:
         return frame
 
 def process_frame(frame: np.ndarray) -> np.ndarray:
-    # 转灰度 + 二值化到 0/255
-    if frame.ndim == 3:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = frame.copy()
+    """
+    将主体 pattern 在空白区域递归缩放铺满后返回新帧。
+    JIT: 用 numba 加速单帧位置搜索；
+    Multiprocessing: run() 里可以按需并行处理多帧。
+    """
 
-    bin_frame = np.where(gray < 128, 0, 255).astype(np.uint8)
+    def binarize(input_frame: np.ndarray) -> np.ndarray:
+        if input_frame.ndim == 3:
+            gray = cv2.cvtColor(input_frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = input_frame
+        return np.where(gray < 128, 0, 255).astype(np.uint8)
 
-    # 主颜色：出现次数最多的那个（通常是背景）
-    counts = np.bincount(bin_frame.flatten(), minlength=256)
-    main_color = np.argmax(counts)
+    def extract_pattern(binarized: np.ndarray) -> tuple[Optional[np.ndarray], int]:
+        # 主颜色：出现次数最多的那个（通常是背景）
+        counts = np.bincount(binarized.flatten(), minlength=256)
+        main_color_local = int(np.argmax(counts))
+        body_mask = (binarized != main_color_local)
+        if not np.any(body_mask):
+            return None, main_color_local
+        ys, xs = np.where(body_mask)
+        y1, y2 = ys.min(), ys.max() + 1
+        x1, x2 = xs.min(), xs.max() + 1
+        return binarized[y1:y2, x1:x2].copy(), main_color_local
 
-    # 主体区域（非 main_color）的 mask
-    body_mask = (bin_frame != main_color)
-    
-    # 没有主体，直接返回原帧
-    if not np.any(body_mask):
+    def resize_pattern(pattern: np.ndarray, target_h: int, target_w: int, main_color_local: int) -> np.ndarray:
+        resized = cv2.resize(pattern, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        resized = np.where(resized < 128, 0, 255).astype(np.uint8)
+        foreground_color = 0 if main_color_local == 255 else 255
+        return np.where(resized == main_color_local, main_color_local, foreground_color).astype(np.uint8)
+
+    def recursive_place(binarized: np.ndarray, pattern: np.ndarray, main_color_local: int, max_length: int) -> int:
+        """
+        从 max_length 开始尝试等比例缩放 pattern，优先放置大尺寸。
+        成功放置后写回 binarized，返回放置的最大边长；失败返回 0。
+        """
+        ph, pw = pattern.shape
+        frame_h, frame_w = binarized.shape
+        base_max_len = max(ph, pw)
+        # 允许扩张到帧的最大边或当前限制
+        allowed_max = min(max(frame_h, frame_w), max_length)
+        # 从大到小尝试，直到触底 MINIMAL_PATTERN_SIZE
+        for target_len in range(allowed_max, MINIMAL_PATTERN_SIZE - 1, -1):
+            scale = target_len / base_max_len
+            target_h = max(1, int(round(ph * scale)))
+            target_w = max(1, int(round(pw * scale)))
+            if max(target_h, target_w) < MINIMAL_PATTERN_SIZE:
+                continue
+            if target_h > frame_h or target_w > frame_w:
+                continue
+
+            scaled_pattern = resize_pattern(pattern, target_h, target_w, main_color_local)
+            background_mask = (binarized == main_color_local)
+            found, top, left = find_first_fit(background_mask, target_h, target_w)
+            if found:
+                binarized[top:top+target_h, left:left+target_w] = scaled_pattern
+                return max(target_h, target_w)
+        return 0
+
+    bin_frame = binarize(frame)
+    pattern, main_color = extract_pattern(bin_frame)
+
+    if pattern is None:
         logger.debug("No body detected in frame, returning original")
         return frame
 
-    # 主体的最小外接矩形
-    ys, xs = np.where(body_mask)
-    y1, y2 = ys.min(), ys.max() + 1
-    x1, x2 = xs.min(), xs.max() + 1
-
-    # pattern：主体所在的矩形块（单通道二值图）
-    pattern = bin_frame[y1:y2, x1:x2].copy()
-    ph, pw = pattern.shape
-    
-    def recursive_place(binarized: np.ndarray, pattern: np.ndarray) -> int:
-        """
-        把 pattern 放到当前 frame 的空白区域（== main_color），保持原尺寸。
-        能放则放一块，返回 pattern 的尺寸；不能放返回 0。
-        """
-        ph, pw = pattern.shape
-        h, w = binarized.shape
-        
-        if max(ph, pw) < MIMIMAL_PATTERN_SIZE:
-            return 0
-
-        background_mask = (binarized == main_color)
-        tqdm_agent = tqdm.tqdm(total=(h - ph + 1) * (w - pw + 1), desc="Recursive place")
-        for top in range(0, h - ph + 1):
-            for left in range(0, w - pw + 1):
-                tqdm_agent.update(1)
-                region = background_mask[top:top+ph, left:left+pw]
-                if np.all(region):
-                    binarized[top:top+ph, left:left+pw] = pattern
-                    return max(ph, pw)
-        
-        return 0
-
-    # 用 while 循环不断往空白处塞 pattern，直到再也塞不下
-    length = max(ph, pw)
     placement_count = 0
-    
-    while length > MIMIMAL_PATTERN_SIZE:
-        new_len = recursive_place(bin_frame, pattern)
-        if new_len == 0:
+    max_len = max(bin_frame.shape)
+    last_len = max_len
+
+    while last_len > MINIMAL_PATTERN_SIZE:
+        placed_len = recursive_place(bin_frame, pattern, main_color, last_len)
+        if placed_len == 0 or placed_len <= MINIMAL_PATTERN_SIZE:
             break
         placement_count += 1
-        length = new_len
-        tqdm.tqdm.write(f"Placed pattern at {length} length")
-        cv2.imwrite(f"out_{placement_count}.png", bin_frame)
-    
+        last_len = placed_len
+
     if placement_count > 0:
         logger.debug(f"Placed pattern {placement_count} times")
 
-    # 把单通道结果扩展回 3 通道，保持和输入一样的形状
     if frame.ndim == 3:
-        out = cv2.cvtColor(bin_frame, cv2.COLOR_GRAY2BGR)
-    else:
-        out = bin_frame
-        
-    cv2.imwrite(f"out_{time.time()}.png", out)
-
-    return out
+        return cv2.cvtColor(bin_frame, cv2.COLOR_GRAY2BGR)
+    
+    return bin_frame
 
 if __name__ == "__main__":
     processor = recursive_video_processor()
     processor.process_frame = staticmethod(process_frame) # override the process_frame method with real implementation
-    processor.run()
+    processor.run(use_multiprocessing=True, workers=os.cpu_count())
