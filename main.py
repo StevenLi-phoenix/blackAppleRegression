@@ -1,11 +1,13 @@
 import cv2
 import numpy as np
 import os
+import hashlib
 from pathlib import Path
 from typing import Generator, Optional
 import tqdm
 import time
 import logging
+from functools import partial
 from multiprocessing import Pool
 import numba
 
@@ -19,6 +21,12 @@ MINIMAL_PATTERN_SIZE = MIMIMAL_PATTERN_SIZE  # Align naming with description
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler())
+
+def _md5_video_path(path: Path) -> str:
+    return hashlib.md5(str(Path(path).resolve()).encode("utf-8")).hexdigest()
+
+def _md5_frame(frame: np.ndarray) -> str:
+    return hashlib.md5(frame.tobytes()).hexdigest()
 
 @numba.njit(cache=True)
 def find_first_fit(background_mask: np.ndarray, patch_h: int, patch_w: int):
@@ -52,6 +60,28 @@ def find_first_fit(background_mask: np.ndarray, patch_h: int, patch_w: int):
             if total == area:
                 return True, top, left
     return False, -1, -1
+
+def process_frame_with_cache(frame: np.ndarray, video_hash: str, cache_root: Path = Path("cache")) -> np.ndarray:
+    """
+    基于帧内容和视频路径 md5 的缓存：cache/<video_hash>/<frame_hash>.png
+    """
+    cache_dir = cache_root / video_hash
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    frame_hash = _md5_frame(frame)
+    cache_file = cache_dir / f"{frame_hash}.png"
+
+    if cache_file.exists():
+        cached = cv2.imread(str(cache_file), cv2.IMREAD_UNCHANGED)
+        if cached is not None:
+            logger.info(f"Cache hit: {cache_file}")
+            return cached
+        logger.info(f"Cache miss (corrupted cache): {cache_file}")
+    else:
+        logger.info(f"Cache miss: {cache_file}")
+
+    processed = process_frame(frame)
+    cv2.imwrite(str(cache_file), processed)
+    return processed
 
 class recursive_video_processor:
     video_informations = {
@@ -105,18 +135,22 @@ class recursive_video_processor:
         stream:Generator[np.ndarray, None, None],
         use_multiprocessing: bool = False,
         workers: Optional[int] = None,
+        video_path: Path = video_path,
+        cache_root: Path = Path("cache"),
     ) -> Generator[np.ndarray, None, None]:
+        video_hash = _md5_video_path(video_path)
         if use_multiprocessing:
             worker_count = workers or os.cpu_count() or 1
+            worker = partial(process_frame_with_cache, video_hash=video_hash, cache_root=cache_root)
             with Pool(processes=worker_count) as pool:
-                for processed in pool.imap(process_frame, stream, chunksize=1):
+                for processed in pool.imap(worker, stream, chunksize=1):
                     yield processed
             return
 
         for frame in stream:
             assert frame is not None, "Frame is None"
             assert frame.size > 0, "Frame is empty"
-            yield self.process_frame(frame)
+            yield process_frame_with_cache(frame, video_hash, cache_root)
 
     def save_stream(self, stream:Generator[np.ndarray, None, None], output_path:Path = Path("output.mp4")) -> None:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -161,12 +195,13 @@ class recursive_video_processor:
                 out.release()
                 logger.info(f"Video saved to {output_path}, frames written: {frame_count}")
 
-    def run(self, use_multiprocessing: bool = False, workers: Optional[int] = None):
+    def run(self, video_path: Path = video_path, use_multiprocessing: bool = False, workers: Optional[int] = None):
         stream = self.play_video(video_path=video_path)
         processed_stream = self.process_frame_stream(
             stream,
             use_multiprocessing=use_multiprocessing,
             workers=workers,
+            video_path=video_path,
         )
         self.save_stream(processed_stream, output_path="out.mp4")
 
