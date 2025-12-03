@@ -13,10 +13,7 @@ import numba
 
 video_path = Path("BadApple.mp4")
 
-FAST_TEST = 100
-MIMIMAL_PATTERN_SIZE = 10  # 最小方块尺寸
-MINIMAL_PATTERN_SIZE = MIMIMAL_PATTERN_SIZE  # Align naming with description
-
+MINIMAL_PATTERN_SIZE = 10  # 最小方块尺寸
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -80,9 +77,9 @@ def process_frame_with_cache(frame: np.ndarray, video_hash: str, cache_root: Pat
     if cache_file.exists():
         cached = cv2.imread(str(cache_file), cv2.IMREAD_UNCHANGED)
         if cached is not None:
-            logger.info(f"Cache hit: {cache_file}")
+            logger.debug(f"Cache hit: {cache_file}")
             return cached
-        logger.info(f"Cache miss (corrupted cache): {cache_file}")
+        logger.debug(f"Cache miss (corrupted cache): {cache_file}")
 
     processed = process_frame(frame)
     cv2.imwrite(str(cache_file), processed)
@@ -189,12 +186,6 @@ class recursive_video_processor:
             logger.info(f"Video saved to {output_path}, frames written: {frame_count}")
         else:
             logger.warning("No frames written, nothing saved")
-            
-        if FAST_TEST:
-            if frame_count > FAST_TEST:
-                logger.info(f"Fast test completed, frames written: {frame_count}")
-                out.release()
-                logger.info(f"Video saved to {output_path}, frames written: {frame_count}")
 
     def run(self, video_path: Path = video_path, use_multiprocessing: bool = False, workers: Optional[int] = None):
         stream = self.play_video(video_path=video_path)
@@ -306,4 +297,4 @@ def process_frame(frame: np.ndarray) -> np.ndarray:
 if __name__ == "__main__":
     processor = recursive_video_processor()
     processor.process_frame = staticmethod(process_frame) # override the process_frame method with real implementation
-    processor.run(use_multiprocessing=True, workers=os.cpu_count())
+    processor.run(use_multiprocessing=True, workers=max(1, os.cpu_count()//2)) # reason for //2 is adjust for hyperthreading and other workloads
