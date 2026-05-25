@@ -16,7 +16,11 @@ video_path = Path("BadApple.mp4")
 MINIMAL_PATTERN_SIZE = 10  # 最小方块尺寸
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
+
+# Create formatter with timestamp
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
 class TqdmLoggingHandler(logging.Handler):
     def emit(self, record):
         try:
@@ -24,7 +28,15 @@ class TqdmLoggingHandler(logging.Handler):
             tqdm.tqdm.write(msg)
         except Exception:
             self.handleError(record)
-logger.addHandler(TqdmLoggingHandler())
+
+# Add handlers with formatter
+tqdm_handler = TqdmLoggingHandler()
+tqdm_handler.setFormatter(formatter)
+logger.addHandler(tqdm_handler)
+
+file_handler = logging.FileHandler("converted.log")
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
 
 def _md5_video_path(path: Path) -> str:
     return hashlib.md5(str(Path(path).resolve()).encode("utf-8")).hexdigest()
@@ -214,6 +226,8 @@ def process_frame(frame: np.ndarray) -> np.ndarray:
     JIT: 用 numba 加速单帧位置搜索；
     Multiprocessing: run() 里可以按需并行处理多帧。
     """
+    TIME_LIMIT = 1.0  # 秒，单帧处理超时就放弃递归，防止卡死
+    start_time = time.perf_counter()
 
     def binarize(input_frame: np.ndarray) -> np.ndarray:
         if input_frame.ndim == 3:
@@ -245,6 +259,9 @@ def process_frame(frame: np.ndarray) -> np.ndarray:
         从 max_length 开始尝试等比例缩放 pattern，优先放置大尺寸。
         成功放置后写回 binarized，返回放置的最大边长；失败返回 0。
         """
+        if time.perf_counter() - start_time > TIME_LIMIT:
+            return 0
+
         ph, pw = pattern.shape
         frame_h, frame_w = binarized.shape
         base_max_len = max(ph, pw)
@@ -280,6 +297,9 @@ def process_frame(frame: np.ndarray) -> np.ndarray:
     last_len = max_len
 
     while last_len > MINIMAL_PATTERN_SIZE:
+        if time.perf_counter() - start_time > TIME_LIMIT:
+            logger.warning("Process frame timeout, returning partially filled frame")
+            break
         placed_len = recursive_place(bin_frame, pattern, main_color, last_len)
         if placed_len == 0 or placed_len <= MINIMAL_PATTERN_SIZE:
             break
@@ -297,4 +317,4 @@ def process_frame(frame: np.ndarray) -> np.ndarray:
 if __name__ == "__main__":
     processor = recursive_video_processor()
     processor.process_frame = staticmethod(process_frame) # override the process_frame method with real implementation
-    processor.run(use_multiprocessing=True, workers=max(1, os.cpu_count()//2)) # reason for //2 is adjust for hyperthreading and other workloads
+    processor.run(use_multiprocessing=True, workers=max(1, (os.cpu_count() or 0) //2)) # reason for //2 is adjust for hyperthreading and other workloads
