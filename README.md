@@ -6,8 +6,7 @@ Each frame is binarized, a dominant pattern is extracted, then recursively place
 
 ## Demo
 
-<!-- TODO: replace with YouTube unlisted link once uploaded -->
-
+[![YouTube](https://img.shields.io/badge/YouTube-Watch-FF0000?logo=youtube)](https://youtu.be/IF1Y2DUaxM8)
 [![Bilibili](https://img.shields.io/badge/Bilibili-Watch-00A1D6?logo=bilibili)](https://www.bilibili.com/video/BV1Bp2YBzEMR/)
 
 ## How it works
