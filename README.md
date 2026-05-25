@@ -4,6 +4,8 @@ Render the classic [Bad Apple!!](https://www.youtube.com/watch?v=FtutLA63Cp8) vi
 
 Each frame is binarized, a dominant pattern is extracted, then recursively placed at decreasing scales to approximate the original — resulting in a fractal-like mosaic effect.
 
+> **⚠️ Photosensitivity Warning**: This video contains rapid flashing patterns and high-contrast flickering. Viewer discretion is advised for those with photosensitive epilepsy.
+
 ## Demo
 
 [![YouTube](https://img.shields.io/badge/YouTube-Watch-FF0000?logo=youtube)](https://youtu.be/IF1Y2DUaxM8)
