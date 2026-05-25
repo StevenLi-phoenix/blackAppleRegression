@@ -1,5 +1,7 @@
 *.mp4
+*.m4a
 *.png
+*.log
 __pycache__/
 cache/
 output/

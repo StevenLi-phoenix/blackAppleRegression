@@ -298,7 +298,7 @@ def process_frame(frame: np.ndarray) -> np.ndarray:
 
     while last_len > MINIMAL_PATTERN_SIZE:
         if time.perf_counter() - start_time > TIME_LIMIT:
-            logger.warning("Process frame timeout, returning partially filled frame")
+            logger.warning(f"Process frame timeout, partially filled frame {placement_count} times since last_len: {last_len}")
             break
         placed_len = recursive_place(bin_frame, pattern, main_color, last_len)
         if placed_len == 0 or placed_len <= MINIMAL_PATTERN_SIZE:
